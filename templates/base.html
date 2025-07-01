@@ -1,0 +1,136 @@
+<!-- templates/base.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Video Converter{% endblock %}</title>
+    
+    <!-- CSS Files -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    {% block extra_css %}{% endblock %}
+    
+    <!-- Favicon -->
+    <link rel="icon" type="image/x-icon" href="{{ url_for('static', filename='assets/favicon.ico') }}">
+    
+    <!-- Meta Tags -->
+    <meta name="description" content="Free online video and audio converter supporting multiple formats">
+    <meta name="keywords" content="video converter, audio converter, mp4, avi, mp3, wav, online converter">
+    <meta name="author" content="Video Converter System">
+</head>
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="container">
+            <div class="header-content">
+                <div class="logo">
+                    <a href="{{ url_for('index') }}">
+                        <h1>🎬 Video Converter</h1>
+                    </a>
+                </div>
+                
+                <nav class="nav">
+                    <ul>
+                        <li><a href="{{ url_for('index') }}">Home</a></li>
+                        <li><a href="#formats">Formats</a></li>
+                        <li><a href="#about">About</a></li>
+                        {% if session.get('admin_logged_in') %}
+                            <li><a href="{{ url_for('admin_dashboard') }}">Dashboard</a></li>
+                            <li><a href="{{ url_for('admin_logout') }}">Logout</a></li>
+                        {% else %}
+                            <li><a href="{{ url_for('admin_login') }}">Admin</a></li>
+                        {% endif %}
+                    </ul>
+                </nav>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="main">
+        {% block content %}{% endblock %}
+    </main>
+
+    <!-- Footer -->
+    <footer class="footer">
+        <div class="container">
+            <div class="footer-content">
+                <div class="footer-section">
+                    <h3>Supported Formats</h3>
+                    <div class="format-lists">
+                        <div class="format-group">
+                            <h4>Video</h4>
+                            <p>MP4, AVI, MOV, MKV, FLV, WebM, MPEG</p>
+                        </div>
+                        <div class="format-group">
+                            <h4>Audio</h4>
+                            <p>MP3, WAV, MP4 Audio</p>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="footer-section">
+                    <h3>Features</h3>
+                    <ul>
+                        <li>✅ Fast conversion</li>
+                        <li>✅ Multiple formats</li>
+                        <li>✅ No registration required</li>
+                        <li>✅ Files auto-deleted after 24h</li>
+                        <li>✅ Secure processing</li>
+                    </ul>
+                </div>
+                
+                <div class="footer-section">
+                    <h3>About</h3>
+                    <p>Free online video and audio converter. Convert your media files quickly and securely. All files are automatically deleted after 24 hours for your privacy.</p>
+                </div>
+            </div>
+            
+            <div class="footer-bottom">
+                <p>&copy; 2024 Video Converter System. All rights reserved.</p>
+                <p>Server: {{ config.SERVER_NAME if config else 'Unknown' }}</p>
+            </div>
+        </div>
+    </footer>
+
+    <!-- Flash Messages -->
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+            <div class="flash-messages">
+                {% for category, message in messages %}
+                    <div class="flash-message flash-{{ category }}">
+                        <span class="message-text">{{ message }}</span>
+                        <button class="close-btn" onclick="this.parentElement.remove()">&times;</button>
+                    </div>
+                {% endfor %}
+            </div>
+        {% endif %}
+    {% endwith %}
+
+    <!-- Loading Overlay -->
+    <div id="loading-overlay" class="loading-overlay" style="display: none;">
+        <div class="loading-content">
+            <div class="spinner"></div>
+            <p>Processing...</p>
+        </div>
+    </div>
+
+    <!-- JavaScript Files -->
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+    {% block extra_js %}{% endblock %}
+    
+    <!-- Auto-hide flash messages -->
+    <script>
+        // Auto-hide flash messages after 5 seconds
+        setTimeout(function() {
+            const flashMessages = document.querySelectorAll('.flash-message');
+            flashMessages.forEach(function(message) {
+                message.style.opacity = '0';
+                setTimeout(function() {
+                    message.remove();
+                }, 300);
+            });
+        }, 5000);
+    </script>
+</body>
+</html>

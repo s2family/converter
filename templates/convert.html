@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Converting File - Video Converter</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        .progress-container { margin: 20px 0; }
+        .progress-bar { width: 100%; height: 30px; background: #f0f0f0; border-radius: 15px; overflow: hidden; }
+        .progress-fill { height: 100%; background: #4CAF50; transition: width 0.3s ease; border-radius: 15px; }
+        .progress-text { text-align: center; margin: 10px 0; font-weight: bold; }
+        .status-text { text-align: center; margin: 10px 0; font-size: 18px; }
+        .btn { background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; text-decoration: none; display: inline-block; }
+        .file-info { background: #f8f9fa; padding: 20px; border-radius: 10px; margin: 20px 0; }
+    </style>
+</head>
+<body>
+    <h1>🔄 Converting Your File</h1>
+    
+    <div class="file-info">
+        <h3>File Information</h3>
+        <p><strong>File:</strong> {{ job.original_filename }}</p>
+        <p><strong>Converting:</strong> {{ job.original_format.upper() }} → {{ job.target_format.upper() }}</p>
+        <p><strong>Type:</strong> {{ job.file_type.title() }}</p>
+        <p><strong>Status:</strong> {{ job.status.title() }}</p>
+    </div>
+    
+    <div class="progress-container">
+        <div class="progress-bar">
+            <div class="progress-fill" id="progress-fill" style="width: {{ job.progress }}%"></div>
+        </div>
+        <div class="progress-text" id="progress-text">{{ job.progress }}%</div>
+        <div class="status-text" id="status-text">
+            {% if job.status == 'pending' %}⏳ Preparing...
+            {% elif job.status == 'processing' %}🔄 Converting...
+            {% elif job.status == 'completed' %}✅ Completed!
+            {% elif job.status == 'failed' %}❌ Failed
+            {% endif %}
+        </div>
+        
+        {% if job.error_message %}
+        <div style="color: red; text-align: center; margin: 10px 0;">
+            Error: {{ job.error_message }}
+        </div>
+        {% endif %}
+    </div>
+    
+    {% if job.status == 'completed' %}
+    <div style="text-align: center;">
+        <a href="/download/{{ job.id }}" class="btn">📥 Download File</a>
+    </div>
+    {% endif %}
+    
+    <div style="text-align: center; margin: 20px 0;">
+        <a href="/" class="btn" style="background: #6c757d;">🏠 Convert Another File</a>
+    </div>
+
+    <script>
+        const jobId = '{{ job.id }}';
+        
+        function updateProgress() {
+            fetch('/api/progress/' + jobId)
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('progress-fill').style.width = data.progress + '%';
+                    document.getElementById('progress-text').textContent = data.progress + '%';
+                    
+                    if (data.status === 'completed') {
+                        document.getElementById('status-text').innerHTML = '✅ Completed!';
+                        setTimeout(() => {
+                            window.location.href = '/download/' + jobId;
+                        }, 2000);
+                    } else if (data.status === 'failed') {
+                        document.getElementById('status-text').innerHTML = '❌ Failed';
+                    } else if (data.status === 'processing') {
+                        document.getElementById('status-text').innerHTML = '🔄 Converting...';
+                    }
+                })
+                .catch(error => console.error('Error:', error));
+        }
+        
+        // Auto-start conversion and update progress
+        if ('{{ job.status }}' === 'pending') {
+            fetch('/api/convert', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({job_id: jobId})
+            });
+        }
+        
+        // Update progress every 2 seconds
+        const interval = setInterval(() => {
+            updateProgress();
+            
+            // Stop updating if completed or failed
+            if ('{{ job.status }}' === 'completed' || '{{ job.status }}' === 'failed') {
+                clearInterval(interval);
+            }
+        }, 2000);
+    </script>
+</body>
+</html>

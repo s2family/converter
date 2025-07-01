@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Download Ready - Video Converter</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; text-align: center; }
+        .download-btn { background: #28a745; color: white; padding: 15px 30px; border: none; border-radius: 5px; cursor: pointer; text-decoration: none; font-size: 18px; display: inline-block; margin: 20px 0; }
+        .download-btn:hover { background: #218838; }
+        .file-info { background: #f8f9fa; padding: 20px; border-radius: 10px; margin: 20px 0; }
+        .btn { background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; text-decoration: none; display: inline-block; }
+    </style>
+</head>
+<body>
+    <h1>✅ Conversion Complete!</h1>
+    <p>Your file has been successfully converted!</p>
+    
+    <div class="file-info">
+        <h3>File Details</h3>
+        <p><strong>Original:</strong> {{ job.original_filename }}</p>
+        <p><strong>Converted:</strong> {{ job.original_filename.rsplit('.', 1)[0] }}.{{ job.target_format }}</p>
+        <p><strong>Format:</strong> {{ job.original_format.upper() }} → {{ job.target_format.upper() }}</p>
+    </div>
+    
+    <a href="/api/download/{{ job.id }}" class="download-btn">📥 Download Your File</a>
+    
+    <p><small>⏰ This file will be automatically deleted after 24 hours</small></p>
+    
+    <div>
+        <a href="/" class="btn">🔄 Convert Another File</a>
+    </div>
+</body>
+</html>

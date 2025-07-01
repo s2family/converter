@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Video Converter</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        .upload-form { border: 2px dashed #ccc; padding: 40px; text-align: center; margin: 20px 0; }
+        .btn { background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; }
+        .btn:hover { background: #0056b3; }
+        .format-selection { margin: 20px 0; }
+        .format-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); gap: 10px; }
+        .format-option { text-align: center; }
+    </style>
+</head>
+<body>
+    <h1>🎬 Video Converter</h1>
+    <p>Convert your video and audio files quickly and easily!</p>
+    
+    <form id="upload-form" enctype="multipart/form-data" action="/upload" method="post">
+        <div class="upload-form">
+            <h3>Select File to Convert</h3>
+            <input type="file" name="file" accept="video/*,audio/*" required>
+            <br><br>
+            
+            <div class="format-selection">
+                <h4>Convert to:</h4>
+                <div class="format-grid">
+                    <label class="format-option">
+                        <input type="radio" name="target_format" value="mp4" required> MP4
+                    </label>
+                    <label class="format-option">
+                        <input type="radio" name="target_format" value="avi"> AVI
+                    </label>
+                    <label class="format-option">
+                        <input type="radio" name="target_format" value="mp3"> MP3
+                    </label>
+                    <label class="format-option">
+                        <input type="radio" name="target_format" value="wav"> WAV
+                    </label>
+                </div>
+            </div>
+            
+            <br>
+            <button type="submit" class="btn">Start Conversion</button>
+        </div>
+    </form>
+
+    <script>
+        document.getElementById('upload-form').addEventListener('submit', function(e) {
+            e.preventDefault();
+            
+            const formData = new FormData(this);
+            
+            fetch('/upload', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    window.location.href = data.redirect_url;
+                } else {
+                    alert('Error: ' + data.error);
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                alert('Upload failed');
+            });
+        });
+    </script>
+</body>
+</html>
