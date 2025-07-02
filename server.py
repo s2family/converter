@@ -1,996 +1,1181 @@
-# server.py - Simple Video Converter System
-from flask import Flask, request, jsonify, send_file, session, redirect, url_for, flash
-from flask_sqlalchemy import SQLAlchemy
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+File Storage & Sharing Service
+Admin controlled storage duration, 15GB max size
+"""
+
+from flask import Flask, render_template, request, jsonify, send_file, redirect, url_for, session, abort
 from werkzeug.utils import secure_filename
-import os
-import uuid
-import subprocess
-import threading
-import time
-from datetime import datetime, timedelta
+from werkzeug.security import generate_password_hash, check_password_hash
+import sqlite3, os, uuid, hashlib, time, threading, secrets, mimetypes, qrcode, io, base64
+from datetime import datetime, timedelta, timezone
+from functools import wraps
+import logging
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-class Config:
-    SECRET_KEY = 'video-converter-secret-key-2024'
-    DEBUG = True
-    
-    # Database
-    SQLALCHEMY_DATABASE_URI = 'sqlite:///video_converter.db'
-    SQLALCHEMY_TRACK_MODIFICATIONS = False
-    
-    # Storage
-    UPLOAD_FOLDER = 'uploads'
-    ORIGINAL_FOLDER = os.path.join(UPLOAD_FOLDER, 'original')
-    CONVERTED_FOLDER = os.path.join(UPLOAD_FOLDER, 'converted')
-    MAX_CONTENT_LENGTH = 500 * 1024 * 1024  # 500MB
-    
-    # Formats
-    AUDIO_FORMATS = ['mp3', 'wav', 'mp4']
-    VIDEO_FORMATS = ['mp4', 'avi', 'mpeg', 'mov', 'flv', 'webm', 'mkv']
-    ALLOWED_EXTENSIONS = AUDIO_FORMATS + VIDEO_FORMATS
-    
-    # Admin
-    ADMIN_USERNAME = 'admin'
-    ADMIN_PASSWORD = 'admin'
-    
-    # Cache
-    DEFAULT_CACHE_HOURS = 24
+# ===== LOGGING SETUP =====
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('app.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-# =============================================================================
-# INITIALIZE FLASK
-# =============================================================================
 app = Flask(__name__)
-app.config.from_object(Config)
+app.secret_key = secrets.token_hex(32)
+
+# ===== CONFIGURATION =====
+UPLOAD_FOLDER = os.path.join('static', 'uploads', 'banners')
+STORAGE_FOLDER = os.path.join('storage', 'files')
+MAX_CONTENT_LENGTH = 15 * 1024 * 1024 * 1024  # 15GB - Tăng từ 1GB
+app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
+BANNER_MAX_SIZE = 16 * 1024 * 1024  # 16MB for banners
+ALLOWED_BANNER_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
 
 # Create directories
-os.makedirs(Config.ORIGINAL_FOLDER, exist_ok=True)
-os.makedirs(Config.CONVERTED_FOLDER, exist_ok=True)
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(STORAGE_FOLDER, exist_ok=True)
+
+# ===== DATABASE SETUP =====
+def init_db():
+    conn = sqlite3.connect('file_storage.db')
+    cursor = conn.cursor()
+    
+    # Files table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS files (
+            id TEXT PRIMARY KEY,
+            original_name TEXT NOT NULL,
+            stored_name TEXT NOT NULL,
+            file_type TEXT,
+            file_size INTEGER DEFAULT 0,
+            mime_type TEXT,
+            share_code TEXT UNIQUE NOT NULL,
+            password TEXT,
+            download_limit INTEGER DEFAULT 100,
+            download_count INTEGER DEFAULT 0,
+            uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            expires_at DATETIME,
+            last_accessed DATETIME,
+            uploader_ip TEXT,
+            description TEXT,
+            is_public BOOLEAN DEFAULT 1
+        )
+    ''')
+    
+    # Visitors table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS visitors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT UNIQUE,
+            ip_address TEXT,
+            user_agent TEXT,
+            first_visit DATETIME,
+            last_activity DATETIME,
+            page_views INTEGER DEFAULT 1,
+            is_active BOOLEAN DEFAULT 1
+        )
+    ''')
+    
+    # Banners table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS banners (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT,
+            image_path TEXT,
+            link_url TEXT,
+            position TEXT CHECK(position IN ('left', 'right')),
+            clicks INTEGER DEFAULT 0,
+            status BOOLEAN DEFAULT 1,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Settings table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            description TEXT
+        )
+    ''')
+    
+    # Download stats table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS download_stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id TEXT,
+            file_name TEXT,
+            download_ip TEXT,
+            download_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+            user_agent TEXT,
+            FOREIGN KEY (file_id) REFERENCES files (id)
+        )
+    ''')
+    
+    # Insert default settings
+    default_settings = [
+        ('admin_username', 'admin', 'Admin username'),
+        ('admin_password_hash', generate_password_hash('admin123'), 'Admin password hash'),
+        ('site_title', 'File Storage & Sharing', 'Site title'),
+        ('maintenance_mode', 'false', 'Maintenance mode'),
+        ('auto_cleanup_enabled', 'false', 'Auto cleanup enabled'),
+        ('cleanup_interval_minutes', '60', 'Cleanup interval in minutes'),
+        ('default_expire_days', '30', 'Default file expiration days - ADMIN CONTROLLED'),
+        ('max_file_size_gb', '15', 'Maximum file size in GB'),
+        ('max_download_limit', '100', 'Default max downloads per file')
+    ]
+    
+    for key, value, desc in default_settings:
+        cursor.execute('INSERT OR IGNORE INTO settings (key, value, description) VALUES (?, ?, ?)', 
+                      (key, value, desc))
+    
+    conn.commit()
+    conn.close()
 
 # Initialize database
-db = SQLAlchemy(app)
+init_db()
 
-# =============================================================================
-# DATABASE MODEL
-# =============================================================================
-class ConversionJob(db.Model):
-    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    original_filename = db.Column(db.String(255), nullable=False)
-    original_format = db.Column(db.String(10), nullable=False)
-    target_format = db.Column(db.String(10), nullable=False)
-    file_type = db.Column(db.String(10), nullable=False)
-    status = db.Column(db.String(20), default='pending')
-    progress = db.Column(db.Integer, default=0)
-    server_location = db.Column(db.String(20), default='server_a')  # ← SỬA: THÊM DEFAULT VALUE
-    original_path = db.Column(db.String(500))
-    converted_path = db.Column(db.String(500))
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    expires_at = db.Column(db.DateTime)
-    file_size = db.Column(db.Integer, default=0)
-    error_message = db.Column(db.Text)
+# ===== VISITOR TRACKING =====
+class VisitorTracker:
+    def __init__(self):
+        self.active_visitors = {}
+        self.cleanup_thread = threading.Thread(target=self.cleanup_inactive_visitors, daemon=True)
+        self.cleanup_thread.start()
+    
+    def track_visitor(self, request):
+        session_id = session.get('session_id')
+        if not session_id:
+            session_id = str(uuid.uuid4())
+            session['session_id'] = session_id
+        
+        ip_address = request.remote_addr
+        user_agent = request.headers.get('User-Agent', '')
+        current_time = datetime.now(timezone.utc)
+        
+        self.active_visitors[session_id] = current_time
+        
+        conn = sqlite3.connect('file_storage.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT id, page_views FROM visitors WHERE session_id = ?', (session_id,))
+        visitor = cursor.fetchone()
+        
+        if visitor:
+            cursor.execute('''
+                UPDATE visitors 
+                SET last_activity = ?, page_views = page_views + 1, is_active = 1
+                WHERE session_id = ?
+            ''', (current_time, session_id))
+        else:
+            cursor.execute('''
+                INSERT INTO visitors (session_id, ip_address, user_agent, first_visit, last_activity)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (session_id, ip_address, user_agent, current_time, current_time))
+        
+        conn.commit()
+        conn.close()
+        
+        return session_id
+    
+    def get_active_count(self):
+        current_time = datetime.now(timezone.utc)
+        cutoff_time = current_time - timedelta(minutes=5)
+        
+        self.active_visitors = {
+            sid: last_activity for sid, last_activity in self.active_visitors.items()
+            if last_activity > cutoff_time
+        }
+        
+        return len(self.active_visitors)
+    
+    def cleanup_inactive_visitors(self):
+        while True:
+            try:
+                time.sleep(300)  # Clean up every 5 minutes
+                current_time = datetime.now(timezone.utc)
+                cutoff_time = current_time - timedelta(minutes=10)
+                
+                conn = sqlite3.connect('file_storage.db')
+                cursor = conn.cursor()
+                cursor.execute('UPDATE visitors SET is_active = 0 WHERE last_activity < ?', (cutoff_time,))
+                conn.commit()
+                conn.close()
+                
+            except Exception as e:
+                logger.error(f"Visitor cleanup error: {e}")
 
-# =============================================================================
-# UTILITY FUNCTIONS
-# =============================================================================
-def is_allowed_file(filename):
-    return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in Config.ALLOWED_EXTENSIONS
+visitor_tracker = VisitorTracker()
+
+# ===== CACHE SCHEDULER =====
+class CacheScheduler:
+    def __init__(self):
+        self.scheduler_thread = threading.Thread(target=self.run_scheduler, daemon=True)
+        self.scheduler_thread.start()
+        
+    def run_scheduler(self):
+        while True:
+            try:
+                time.sleep(60)  # Check every minute
+                
+                # Get auto cleanup settings
+                conn = sqlite3.connect('file_storage.db')
+                cursor = conn.cursor()
+                
+                cursor.execute('SELECT value FROM settings WHERE key = ?', ('auto_cleanup_enabled',))
+                enabled = cursor.fetchone()
+                enabled = enabled and enabled[0] == 'true'
+                
+                if not enabled:
+                    conn.close()
+                    continue
+                
+                cursor.execute('SELECT value FROM settings WHERE key = ?', ('cleanup_interval_minutes',))
+                interval = cursor.fetchone()
+                interval = int(interval[0]) if interval else 60
+                
+                conn.close()
+                
+                # Simple interval-based cleanup
+                if hasattr(self, 'last_cleanup'):
+                    time_since_last = (datetime.now(timezone.utc) - self.last_cleanup).total_seconds() / 60
+                    if time_since_last < interval:
+                        continue
+                
+                logger.info("Running scheduled cache cleanup...")
+                deleted_count = self.cleanup_expired_files()
+                logger.info(f"Scheduled cleanup completed: {deleted_count} files deleted")
+                self.last_cleanup = datetime.now(timezone.utc)
+                
+            except Exception as e:
+                logger.error(f"Scheduler error: {e}")
+    
+    def cleanup_expired_files(self):
+        try:
+            current_time = datetime.now(timezone.utc)
+            deleted_count = 0
+            
+            conn = sqlite3.connect('file_storage.db')
+            cursor = conn.cursor()
+            
+            # Get expired files
+            cursor.execute('SELECT id, stored_name FROM files WHERE expires_at < ?', (current_time,))
+            expired_files = cursor.fetchall()
+            
+            for file_id, stored_name in expired_files:
+                try:
+                    # Delete physical file
+                    file_path = os.path.join(STORAGE_FOLDER, stored_name)
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                    
+                    # Delete database record
+                    cursor.execute('DELETE FROM files WHERE id = ?', (file_id,))
+                    cursor.execute('DELETE FROM download_stats WHERE file_id = ?', (file_id,))
+                    deleted_count += 1
+                    
+                except Exception as e:
+                    logger.error(f"Error deleting file {file_id}: {e}")
+            
+            conn.commit()
+            conn.close()
+            
+            return deleted_count
+            
+        except Exception as e:
+            logger.error(f"Cleanup error: {e}")
+            return 0
+
+cache_scheduler = CacheScheduler()
+
+# ===== ADMIN AUTHENTICATION =====
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not session.get('admin_logged_in'):
+            return redirect(url_for('admin_login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+# ===== UTILITY FUNCTIONS =====
+def get_admin_settings():
+    """Get admin-controlled settings"""
+    try:
+        conn = sqlite3.connect('file_storage.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT key, value FROM settings WHERE key IN (?, ?, ?)', 
+                      ('default_expire_days', 'max_file_size_gb', 'max_download_limit'))
+        settings = dict(cursor.fetchall())
+        conn.close()
+        
+        return {
+            'expire_days': int(settings.get('default_expire_days', 30)),
+            'max_size_gb': int(settings.get('max_file_size_gb', 15)),
+            'download_limit': int(settings.get('max_download_limit', 100))
+        }
+    except:
+        return {'expire_days': 30, 'max_size_gb': 15, 'download_limit': 100}
+
+def get_banners(position=None):
+    try:
+        conn = sqlite3.connect('file_storage.db')
+        cursor = conn.cursor()
+        
+        if position:
+            cursor.execute('SELECT * FROM banners WHERE position = ? AND status = 1 ORDER BY id DESC', (position,))
+        else:
+            cursor.execute('SELECT * FROM banners WHERE status = 1 ORDER BY id DESC')
+        
+        banners = cursor.fetchall()
+        conn.close()
+        
+        banner_list = []
+        for banner in banners:
+            banner_list.append({
+                'id': banner[0],
+                'title': banner[1],
+                'description': banner[2],
+                'image_path': banner[3],
+                'link_url': banner[4],
+                'position': banner[5],
+                'clicks': banner[6],
+                'status': banner[7],
+                'created_at': banner[8]
+            })
+        
+        return banner_list
+        
+    except Exception as e:
+        logger.error(f"Error getting banners: {e}")
+        return []
+
+def generate_share_code():
+    return hashlib.md5(str(uuid.uuid4()).encode()).hexdigest()[:12]
 
 def get_file_type(filename):
     if not filename or '.' not in filename:
-        return None
+        return 'other'
+    
     ext = filename.rsplit('.', 1)[1].lower()
-    if ext in Config.AUDIO_FORMATS:
-        return 'audio'
-    elif ext in Config.VIDEO_FORMATS:
-        return 'video'
-    return None
+    
+    file_types = {
+        'image': ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'svg'],
+        'video': ['mp4', 'avi', 'mov', 'mkv', 'flv', 'webm', 'wmv'],
+        'audio': ['mp3', 'wav', 'flac', 'aac', 'ogg', 'wma'],
+        'document': ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt'],
+        'archive': ['zip', 'rar', '7z', 'tar', 'gz']
+    }
+    
+    for file_type, extensions in file_types.items():
+        if ext in extensions:
+            return file_type
+    
+    return 'other'
 
-def convert_file_ffmpeg(input_path, output_path, target_format):
-    """Simple FFmpeg conversion"""
+def format_file_size(size_bytes):
+    if size_bytes == 0:
+        return "0B"
+    
+    size_names = ["B", "KB", "MB", "GB", "TB"]
+    i = 0
+    while size_bytes >= 1024 and i < len(size_names) - 1:
+        size_bytes /= 1024.0
+        i += 1
+    
+    return f"{size_bytes:.1f}{size_names[i]}"
+
+def generate_qr_code(url):
     try:
-        cmd = ['ffmpeg', '-i', input_path, '-y', output_path]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        return result.returncode == 0, result.stderr
-    except subprocess.TimeoutExpired:
-        return False, "Conversion timeout"
-    except FileNotFoundError:
-        return False, "FFmpeg not found"
-    except Exception as e:
-        return False, str(e)
+        qr = qrcode.QRCode(version=1, box_size=10, border=5)
+        qr.add_data(url)
+        qr.make(fit=True)
+        
+        img = qr.make_image(fill_color="black", back_color="white")
+        
+        img_buffer = io.BytesIO()
+        img.save(img_buffer, format='PNG')
+        img_buffer.seek(0)
+        
+        return base64.b64encode(img_buffer.getvalue()).decode()
+    except:
+        return None
 
-def start_conversion(job_id):
-    """Background conversion process"""
-    with app.app_context():
-        try:
-            job = ConversionJob.query.get(job_id)
-            if not job:
-                return
-            
-            # Update to processing
-            job.status = 'processing'
-            job.progress = 10
-            db.session.commit()
-            
-            # Generate output path
-            output_filename = f"{job_id}_converted.{job.target_format}"
-            output_path = os.path.join(Config.CONVERTED_FOLDER, output_filename)
-            
-            # Convert file
-            job.progress = 50
-            db.session.commit()
-            
-            success, error = convert_file_ffmpeg(job.original_path, output_path, job.target_format)
-            
-            # Update final status
-            if success and os.path.exists(output_path):
-                job.status = 'completed'
-                job.progress = 100
-                job.converted_path = output_path
-                job.error_message = None
-            else:
-                job.status = 'failed'
-                job.error_message = error or 'Conversion failed'
-            
-            db.session.commit()
-            
-        except Exception as e:
-            job = ConversionJob.query.get(job_id)
-            if job:
-                job.status = 'failed'
-                job.error_message = str(e)
-                db.session.commit()
+# ===== MIDDLEWARE =====
+@app.before_request
+def track_visitors():
+    if request.endpoint and not request.endpoint.startswith('static'):
+        visitor_tracker.track_visitor(request)
 
-# =============================================================================
-# ROUTES
-# =============================================================================
-
+# ===== MAIN ROUTES =====
 @app.route('/')
 def index():
-    """Homepage"""
-    return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Video Converter</title>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <style>
-            body { 
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
-                max-width: 800px; 
-                margin: 0 auto; 
-                padding: 20px; 
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                min-height: 100vh;
-                color: #333;
-            }
-            .container {
-                background: white;
-                border-radius: 20px;
-                padding: 40px;
-                box-shadow: 0 20px 40px rgba(0,0,0,0.1);
-            }
-            .header { text-align: center; margin-bottom: 30px; }
-            .header h1 { color: #667eea; margin-bottom: 10px; }
-            .upload-form { 
-                border: 2px dashed #667eea; 
-                padding: 40px; 
-                text-align: center; 
-                margin: 20px 0; 
-                border-radius: 15px;
-                background: #f8f9ff;
-            }
-            .btn { 
-                background: linear-gradient(45deg, #667eea, #764ba2); 
-                color: white; 
-                padding: 12px 30px; 
-                border: none; 
-                border-radius: 25px; 
-                cursor: pointer; 
-                font-size: 16px;
-                font-weight: 600;
-                transition: transform 0.3s ease;
-            }
-            .btn:hover { transform: translateY(-2px); }
-            .format-grid { 
-                display: grid; 
-                grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); 
-                gap: 15px; 
-                margin: 20px 0; 
-            }
-            .format-option { 
-                background: white;
-                border: 2px solid #e0e6ed;
-                border-radius: 10px;
-                padding: 15px;
-                cursor: pointer;
-                transition: all 0.3s ease;
-            }
-            .format-option:hover {
-                border-color: #667eea;
-                transform: translateY(-2px);
-                box-shadow: 0 5px 15px rgba(102, 126, 234, 0.2);
-            }
-            .format-option input[type="radio"] { display: none; }
-            .format-option input[type="radio"]:checked + label {
-                color: #667eea;
-                font-weight: bold;
-            }
-            .format-option input[type="radio"]:checked ~ * {
-                border-color: #667eea;
-                background: linear-gradient(45deg, #667eea, #764ba2);
-                color: white;
-            }
-            .admin-link {
-                text-align: center;
-                margin-top: 30px;
-                padding-top: 20px;
-                border-top: 1px solid #eee;
-            }
-            .admin-link a {
-                color: #667eea;
-                text-decoration: none;
-                font-weight: 500;
-            }
-            .error { color: #e74c3c; background: #fdf2f2; padding: 10px; border-radius: 5px; margin: 10px 0; }
-            .success { color: #27ae60; background: #f2fdf2; padding: 10px; border-radius: 5px; margin: 10px 0; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="header">
-                <h1>🎬 Video Converter</h1>
-                <p>Convert your video and audio files quickly and securely!</p>
-            </div>
-            
-            <div id="message"></div>
-            
-            <form id="upload-form" enctype="multipart/form-data">
-                <div class="upload-form">
-                    <h3>📁 Choose File to Convert</h3>
-                    <input type="file" name="file" accept="video/*,audio/*" required style="margin: 20px 0;">
-                    <br>
-                    
-                    <div>
-                        <h4>🔄 Convert to:</h4>
-                        <div class="format-grid">
-                            <div class="format-option">
-                                <input type="radio" name="target_format" value="mp4" id="mp4" required>
-                                <label for="mp4">📹 MP4<br><small>Most compatible</small></label>
-                            </div>
-                            <div class="format-option">
-                                <input type="radio" name="target_format" value="avi" id="avi">
-                                <label for="avi">🎬 AVI<br><small>High quality</small></label>
-                            </div>
-                            <div class="format-option">
-                                <input type="radio" name="target_format" value="mp3" id="mp3">
-                                <label for="mp3">🎵 MP3<br><small>Audio only</small></label>
-                            </div>
-                            <div class="format-option">
-                                <input type="radio" name="target_format" value="wav" id="wav">
-                                <label for="wav">🎶 WAV<br><small>Uncompressed</small></label>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <br>
-                    <button type="submit" class="btn" id="convert-btn">
-                        <span id="btn-text">🚀 Start Conversion</span>
-                        <span id="btn-loading" style="display:none;">⏳ Uploading...</span>
-                    </button>
-                </div>
-            </form>
-            
-            <div class="admin-link">
-                <a href="/admin/login">🔐 Admin Panel</a> | 
-                <a href="/test">🧪 Test Page</a>
-            </div>
-        </div>
-
-        <script>
-            document.getElementById('upload-form').addEventListener('submit', function(e) {
-                e.preventDefault();
-                
-                const formData = new FormData(this);
-                const btn = document.getElementById('convert-btn');
-                const btnText = document.getElementById('btn-text');
-                const btnLoading = document.getElementById('btn-loading');
-                const messageDiv = document.getElementById('message');
-                
-                // Show loading
-                btnText.style.display = 'none';
-                btnLoading.style.display = 'inline';
-                btn.disabled = true;
-                
-                fetch('/upload', {
-                    method: 'POST',
-                    body: formData
-                })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        messageDiv.innerHTML = '<div class="success">✅ Upload successful! Redirecting...</div>';
-                        setTimeout(() => {
-                            window.location.href = data.redirect_url;
-                        }, 1000);
-                    } else {
-                        throw new Error(data.error);
-                    }
-                })
-                .catch(error => {
-                    messageDiv.innerHTML = '<div class="error">❌ Error: ' + error.message + '</div>';
-                    btnText.style.display = 'inline';
-                    btnLoading.style.display = 'none';
-                    btn.disabled = false;
-                });
-            });
-            
-            // Format selection styling
-            document.querySelectorAll('.format-option').forEach(option => {
-                option.addEventListener('click', function() {
-                    const radio = this.querySelector('input[type="radio"]');
-                    radio.checked = true;
-                    
-                    // Update styling
-                    document.querySelectorAll('.format-option').forEach(opt => {
-                        opt.style.borderColor = '#e0e6ed';
-                        opt.style.background = 'white';
-                        opt.style.color = '#333';
-                    });
-                    
-                    this.style.borderColor = '#667eea';
-                    this.style.background = 'linear-gradient(45deg, #667eea, #764ba2)';
-                    this.style.color = 'white';
-                });
-            });
-        </script>
-    </body>
-    </html>
-    """
-
-@app.route('/test')
-def test():
-    """Test page"""
-    return f"""
-    <h1>✅ Server Test Page</h1>
-    <p><strong>Server Status:</strong> Running</p>
-    <p><strong>Time:</strong> {datetime.now()}</p>
-    <p><strong>Database:</strong> {'✅ Connected' if db else '❌ Error'}</p>
-    <p><strong>Upload Folder:</strong> {'✅ Exists' if os.path.exists(Config.UPLOAD_FOLDER) else '❌ Missing'}</p>
-    <p><strong>FFmpeg:</strong> {'✅ Available' if os.system('ffmpeg -version > nul 2>&1') == 0 else '❌ Not Found'}</p>
-    
-    <h3>Links:</h3>
-    <ul>
-        <li><a href="/">🏠 Home</a></li>
-        <li><a href="/admin/login">🔐 Admin Login</a></li>
-        <li><a href="/debug">🐛 Debug Info</a></li>
-    </ul>
-    
-    <h3>Database Stats:</h3>
-    <p>Total Jobs: {ConversionJob.query.count()}</p>
-    """
-
-@app.route('/debug')
-def debug():
-    """Debug information"""
-    return f"""
-    <h1>🐛 Debug Information</h1>
-    <ul>
-        <li><strong>Current Directory:</strong> {os.getcwd()}</li>
-        <li><strong>Upload Folder:</strong> {Config.UPLOAD_FOLDER}</li>
-        <li><strong>Original Folder:</strong> {Config.ORIGINAL_FOLDER}</li>
-        <li><strong>Converted Folder:</strong> {Config.CONVERTED_FOLDER}</li>
-        <li><strong>Max File Size:</strong> {Config.MAX_CONTENT_LENGTH / 1024 / 1024} MB</li>
-        <li><strong>Allowed Extensions:</strong> {', '.join(Config.ALLOWED_EXTENSIONS)}</li>
-    </ul>
-    
-    <h3>Folder Status:</h3>
-    <ul>
-        <li>Upload Folder Exists: {os.path.exists(Config.UPLOAD_FOLDER)}</li>
-        <li>Original Folder Exists: {os.path.exists(Config.ORIGINAL_FOLDER)}</li>
-        <li>Converted Folder Exists: {os.path.exists(Config.CONVERTED_FOLDER)}</li>
-    </ul>
-    
-    <p><a href="/">← Back to Home</a></p>
-    """
+    try:
+        left_banners = get_banners('left')
+        right_banners = get_banners('right')
+        admin_settings = get_admin_settings()
+        
+        # Get recent public files
+        conn = sqlite3.connect('file_storage.db')
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, original_name, file_type, file_size, share_code, download_count, uploaded_at
+            FROM files 
+            WHERE is_public = 1 AND expires_at > ? 
+            ORDER BY uploaded_at DESC 
+            LIMIT 10
+        ''', (datetime.now(timezone.utc),))
+        
+        recent_files = []
+        for row in cursor.fetchall():
+            recent_files.append({
+                'id': row[0],
+                'name': row[1],
+                'type': row[2],
+                'size': format_file_size(row[3]),
+                'share_code': row[4],
+                'downloads': row[5],
+                'uploaded_at': row[6]
+            })
+        
+        # Get stats
+        cursor.execute('SELECT COUNT(*) FROM files WHERE expires_at > ?', (datetime.now(timezone.utc),))
+        total_files = cursor.fetchone()[0]
+        
+        cursor.execute('SELECT SUM(file_size) FROM files WHERE expires_at > ?', (datetime.now(timezone.utc),))
+        total_size = cursor.fetchone()[0] or 0
+        
+        cursor.execute('SELECT SUM(download_count) FROM files')
+        total_downloads = cursor.fetchone()[0] or 0
+        
+        conn.close()
+        
+        stats = {
+            'total_files': total_files,
+            'total_size': total_size,
+            'total_downloads': total_downloads
+        }
+        
+        return render_template('index.html', 
+                             left_banners=left_banners, 
+                             right_banners=right_banners,
+                             recent_files=recent_files,
+                             stats=stats,
+                             admin_settings=admin_settings)
+    except Exception as e:
+        logger.error(f"Homepage error: {e}")
+        admin_settings = {'expire_days': 30, 'max_size_gb': 15, 'download_limit': 100}
+        return render_template('index.html', 
+                             left_banners=[], 
+                             right_banners=[],
+                             recent_files=[],
+                             stats={'total_files': 0, 'total_size': 0, 'total_downloads': 0},
+                             admin_settings=admin_settings)
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
-    """Handle file upload"""
     try:
+        # Check if file is in request
         if 'file' not in request.files:
-            return jsonify({'error': 'No file selected'}), 400
+            return jsonify({'success': False, 'error': 'Không có file được chọn'}), 400
         
         file = request.files['file']
-        target_format = request.form.get('target_format', '').lower()
-        
         if file.filename == '':
-            return jsonify({'error': 'No file selected'}), 400
+            return jsonify({'success': False, 'error': 'Không có file được chọn'}), 400
         
-        if not is_allowed_file(file.filename):
-            return jsonify({'error': 'File format not supported'}), 400
+        # Get admin settings
+        admin_settings = get_admin_settings()
         
-        if not target_format or target_format not in Config.ALLOWED_EXTENSIONS:
-            return jsonify({'error': 'Invalid target format'}), 400
+        # Check file size (this is automatically handled by Flask MAX_CONTENT_LENGTH, but let's be explicit)
+        if hasattr(file, 'content_length') and file.content_length:
+            max_size = admin_settings['max_size_gb'] * 1024 * 1024 * 1024
+            if file.content_length > max_size:
+                return jsonify({'success': False, 'error': f'File quá lớn. Tối đa {admin_settings["max_size_gb"]}GB'}), 400
         
-        # Generate job ID
-        job_id = str(uuid.uuid4())
-        filename = secure_filename(file.filename)
-        original_format = filename.rsplit('.', 1)[1].lower()
-        file_type = get_file_type(filename)
+        # Get form data - Note: expire_days is now admin-controlled
+        description = request.form.get('description', '')
+        password = request.form.get('password', '')
+        is_public = request.form.get('is_public') == 'true'
+        
+        # Use admin-controlled expiration
+        expire_days = admin_settings['expire_days']
+        download_limit = admin_settings['download_limit']
+        
+        # Generate unique filename
+        file_id = str(uuid.uuid4())
+        original_name = secure_filename(file.filename)
+        file_ext = original_name.rsplit('.', 1)[1].lower() if '.' in original_name else ''
+        stored_name = f"{file_id}.{file_ext}" if file_ext else file_id
+        file_path = os.path.join(STORAGE_FOLDER, stored_name)
         
         # Save file
-        file_path = os.path.join(Config.ORIGINAL_FOLDER, f"{job_id}_{filename}")
         file.save(file_path)
         file_size = os.path.getsize(file_path)
+        file_type = get_file_type(original_name)
         
-        # Create job record
-        expires_at = datetime.utcnow() + timedelta(hours=Config.DEFAULT_CACHE_HOURS)
-        job = ConversionJob(
-            id=job_id,
-            original_filename=filename,
-            original_format=original_format,
-            target_format=target_format,
-            file_type=file_type,
-            server_location='server_a',  # ← THÊM DÒNG NÀY
-            original_path=file_path,
-            expires_at=expires_at,
-            file_size=file_size
-        )
+        # Create database record
+        share_code = generate_share_code()
+        expires_at = datetime.now(timezone.utc) + timedelta(days=expire_days)
         
-        db.session.add(job)
-        db.session.commit()
+        # Hash password if provided
+        hashed_password = None
+        if password:
+            hashed_password = hashlib.sha256(password.encode()).hexdigest()
+        
+        conn = sqlite3.connect('file_storage.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO files (
+                id, original_name, stored_name, file_type, file_size, 
+                mime_type, share_code, password, download_limit, expires_at, 
+                uploader_ip, description, is_public
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            file_id, original_name, stored_name, file_type, file_size,
+            file.mimetype, share_code, hashed_password, download_limit, expires_at,
+            request.remote_addr, description, is_public
+        ))
+        
+        conn.commit()
+        conn.close()
+        
+        # Generate share URL and QR code
+        share_url = request.url_root + f"f/{share_code}"
+        qr_code = generate_qr_code(share_url)
         
         return jsonify({
             'success': True,
-            'job_id': job_id,
-            'redirect_url': f'/convert/{job_id}'
+            'file_id': file_id,
+            'share_code': share_code,
+            'share_url': share_url,
+            'qr_code': qr_code,
+            'expires_at': expires_at.isoformat(),
+            'expire_days': expire_days
         })
         
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Upload error: {e}")
+        return jsonify({'success': False, 'error': f'Lỗi tải lên: {str(e)}'}), 500
 
-@app.route('/convert/<job_id>')
-def convert_progress(job_id):
-    """Conversion progress page"""
-    job = ConversionJob.query.get_or_404(job_id)
-    
-    if datetime.utcnow() > job.expires_at:
-        return """
-        <h1>⏰ File Expired</h1>
-        <p>This file has expired and been automatically deleted.</p>
-        <a href="/">← Convert New File</a>
-        """, 410
-    
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Converting - Video Converter</title>
-        <style>
-            body {{ font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }}
-            .progress-container {{ margin: 20px 0; }}
-            .progress-bar {{ width: 100%; height: 30px; background: #f0f0f0; border-radius: 15px; overflow: hidden; }}
-            .progress-fill {{ height: 100%; background: linear-gradient(90deg, #4CAF50, #45a049); transition: width 0.3s ease; }}
-            .info {{ background: #f8f9fa; padding: 20px; border-radius: 10px; margin: 20px 0; }}
-            .btn {{ background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 5px; text-decoration: none; display: inline-block; }}
-            .status {{ text-align: center; margin: 20px 0; font-size: 18px; }}
-        </style>
-    </head>
-    <body>
-        <h1>🔄 Converting Your File</h1>
-        
-        <div class="info">
-            <h3>File Information</h3>
-            <p><strong>File:</strong> {job.original_filename}</p>
-            <p><strong>Converting:</strong> {job.original_format.upper()} → {job.target_format.upper()}</p>
-            <p><strong>Type:</strong> {job.file_type.title()}</p>
-            <p><strong>Size:</strong> {job.file_size / 1024 / 1024:.1f} MB</p>
-        </div>
-        
-        <div class="progress-container">
-            <div class="progress-bar">
-                <div class="progress-fill" id="progress-fill" style="width: {job.progress}%"></div>
-            </div>
-            <div class="status" id="status">
-                <div id="progress-text">{job.progress}%</div>
-                <div id="status-text">
-                    {'⏳ Preparing...' if job.status == 'pending' else 
-                     '🔄 Converting...' if job.status == 'processing' else
-                     '✅ Completed!' if job.status == 'completed' else
-                     '❌ Failed'}
-                </div>
-            </div>
-        </div>
-        
-        {f'<div style="color: red; text-align: center;">❌ {job.error_message}</div>' if job.error_message else ''}
-        
-        <div style="text-align: center; margin: 20px 0;">
-            {'<a href="/download/' + job.id + '" class="btn">📥 Download File</a>' if job.status == 'completed' else ''}
-            <a href="/" class="btn" style="background: #6c757d;">🏠 Convert Another</a>
-        </div>
-
-        <script>
-            const jobId = '{job.id}';
-            let currentStatus = '{job.status}';
-            
-            // Auto-start conversion if pending
-            if (currentStatus === 'pending') {{
-                fetch('/api/convert', {{
-                    method: 'POST',
-                    headers: {{'Content-Type': 'application/json'}},
-                    body: JSON.stringify({{job_id: jobId}})
-                }});
-            }}
-            
-            // Update progress
-            function updateProgress() {{
-                fetch('/api/progress/' + jobId)
-                    .then(response => response.json())
-                    .then(data => {{
-                        document.getElementById('progress-fill').style.width = data.progress + '%';
-                        document.getElementById('progress-text').textContent = data.progress + '%';
-                        
-                        let statusText = '⏳ Preparing...';
-                        if (data.status === 'processing') statusText = '🔄 Converting...';
-                        else if (data.status === 'completed') statusText = '✅ Completed!';
-                        else if (data.status === 'failed') statusText = '❌ Failed';
-                        
-                        document.getElementById('status-text').textContent = statusText;
-                        currentStatus = data.status;
-                        
-                        if (data.status === 'completed') {{
-                            setTimeout(() => {{
-                                window.location.href = '/download/' + jobId;
-                            }}, 2000);
-                        }}
-                    }})
-                    .catch(error => console.error('Error:', error));
-            }}
-            
-            // Update every 2 seconds
-            const interval = setInterval(() => {{
-                if (currentStatus !== 'completed' && currentStatus !== 'failed') {{
-                    updateProgress();
-                }} else {{
-                    clearInterval(interval);
-                }}
-            }}, 2000);
-        </script>
-    </body>
-    </html>
-    """
-
-@app.route('/api/convert', methods=['POST'])
-def api_convert():
-    """Start conversion API"""
+@app.route('/f/<share_code>')
+def share_page(share_code):
     try:
-        data = request.get_json()
-        job_id = data.get('job_id')
+        conn = sqlite3.connect('file_storage.db')
+        cursor = conn.cursor()
         
-        job = ConversionJob.query.get(job_id)
-        if not job:
-            return jsonify({'error': 'Job not found'}), 404
+        cursor.execute('SELECT * FROM files WHERE share_code = ?', (share_code,))
+        result = cursor.fetchone()
         
-        if job.status != 'pending':
-            return jsonify({'error': 'Job already processed'}), 400
+        if not result:
+            conn.close()
+            abort(404)
         
-        # Start conversion in background
-        thread = threading.Thread(target=start_conversion, args=(job_id,))
-        thread.daemon = True
-        thread.start()
+        file_data = {
+            'id': result[0],
+            'original_name': result[1],
+            'file_type': result[3],
+            'file_size': format_file_size(result[4]),
+            'share_code': result[6],
+            'has_password': bool(result[7]),
+            'download_limit': result[8],
+            'download_count': result[9],
+            'expires_at': result[11],
+            'description': result[14]
+        }
         
-        return jsonify({'success': True, 'message': 'Conversion started'})
+        # Check if expired
+        if file_data['expires_at']:
+            expires_at = datetime.fromisoformat(file_data['expires_at'].replace('Z', '+00:00'))
+            if datetime.now(timezone.utc) > expires_at:
+                conn.close()
+                return render_template('index.html', error='File đã hết hạn')
+        
+        # Check download limit
+        if file_data['download_count'] >= file_data['download_limit']:
+            conn.close()
+            return render_template('index.html', error='File đã đạt giới hạn tải xuống')
+        
+        # Update last accessed
+        cursor.execute('UPDATE files SET last_accessed = ? WHERE share_code = ?', 
+                      (datetime.now(timezone.utc), share_code))
+        conn.commit()
+        conn.close()
+        
+        return render_template('index.html', shared_file=file_data, show_download=True)
         
     except Exception as e:
+        logger.error(f"Share page error: {e}")
+        abort(500)
+
+@app.route('/download/<share_code>')
+def download_file(share_code):
+    try:
+        password = request.args.get('password', '')
+        
+        conn = sqlite3.connect('file_storage.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT * FROM files WHERE share_code = ?', (share_code,))
+        result = cursor.fetchone()
+        
+        if not result:
+            conn.close()
+            abort(404)
+        
+        file_data = {
+            'id': result[0],
+            'original_name': result[1],
+            'stored_name': result[2],
+            'password': result[7],
+            'download_limit': result[8],
+            'download_count': result[9],
+            'expires_at': result[11]
+        }
+        
+        # Check if expired
+        if file_data['expires_at']:
+            expires_at = datetime.fromisoformat(file_data['expires_at'].replace('Z', '+00:00'))
+            if datetime.now(timezone.utc) > expires_at:
+                conn.close()
+                return jsonify({'error': 'File đã hết hạn'}), 410
+        
+        # Check download limit
+        if file_data['download_count'] >= file_data['download_limit']:
+            conn.close()
+            return jsonify({'error': 'File đã đạt giới hạn tải xuống'}), 403
+        
+        # Check password
+        if file_data['password']:
+            if not password:
+                conn.close()
+                return jsonify({'error': 'Cần mật khẩu'}), 401
+            
+            hashed_password = hashlib.sha256(password.encode()).hexdigest()
+            if hashed_password != file_data['password']:
+                conn.close()
+                return jsonify({'error': 'Mật khẩu sai'}), 401
+        
+        # Check if file exists
+        file_path = os.path.join(STORAGE_FOLDER, file_data['stored_name'])
+        if not os.path.exists(file_path):
+            conn.close()
+            return jsonify({'error': 'File không tồn tại'}), 404
+        
+        # Update download count and log
+        cursor.execute('UPDATE files SET download_count = download_count + 1, last_accessed = ? WHERE share_code = ?', 
+                      (datetime.now(timezone.utc), share_code))
+        
+        cursor.execute('''
+            INSERT INTO download_stats (file_id, file_name, download_ip, user_agent)
+            VALUES (?, ?, ?, ?)
+        ''', (file_data['id'], file_data['original_name'], 
+              request.remote_addr, request.headers.get('User-Agent', '')))
+        
+        conn.commit()
+        conn.close()
+        
+        return send_file(file_path, as_attachment=True, download_name=file_data['original_name'])
+        
+    except Exception as e:
+        logger.error(f"Download error: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/progress/<job_id>')
-def api_progress(job_id):
-    """Get conversion progress"""
-    job = ConversionJob.query.get_or_404(job_id)
-    
-    if datetime.utcnow() > job.expires_at:
-        return jsonify({'error': 'File expired'}), 410
-    
-    return jsonify({
-        'job_id': job.id,
-        'status': job.status,
-        'progress': job.progress,
-        'error_message': job.error_message
-    })
+# ===== BANNER ROUTES =====
+@app.route('/banner/click/<int:banner_id>')
+def banner_click(banner_id):
+    try:
+        conn = sqlite3.connect('file_storage.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('UPDATE banners SET clicks = clicks + 1 WHERE id = ?', (banner_id,))
+        cursor.execute('SELECT link_url FROM banners WHERE id = ?', (banner_id,))
+        result = cursor.fetchone()
+        
+        conn.commit()
+        conn.close()
+        
+        if result and result[0]:
+            return redirect(result[0])
+        else:
+            return redirect(url_for('index'))
+            
+    except Exception as e:
+        logger.error(f"Banner click error: {e}")
+        return redirect(url_for('index'))
 
-@app.route('/download/<job_id>')
-def download_page(job_id):
-    """Download page"""
-    job = ConversionJob.query.get_or_404(job_id)
-    
-    if datetime.utcnow() > job.expires_at:
-        return "<h1>⏰ File Expired</h1><p>This file has expired.</p><a href='/'>Convert New File</a>", 410
-    
-    if job.status != 'completed':
-        return redirect(f'/convert/{job_id}')
-    
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Download Ready - Video Converter</title>
-        <style>
-            body {{ font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; text-align: center; }}
-            .download-btn {{ background: #28a745; color: white; padding: 20px 40px; border: none; border-radius: 10px; font-size: 18px; text-decoration: none; display: inline-block; margin: 20px; }}
-            .info {{ background: #f8f9fa; padding: 20px; border-radius: 10px; margin: 20px 0; }}
-            .btn {{ background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 5px; text-decoration: none; }}
-        </style>
-    </head>
-    <body>
-        <h1>✅ Conversion Complete!</h1>
-        <p>Your file has been successfully converted!</p>
-        
-        <div class="info">
-            <h3>📁 File Details</h3>
-            <p><strong>Original:</strong> {job.original_filename}</p>
-            <p><strong>Converted:</strong> {job.original_filename.rsplit('.', 1)[0]}.{job.target_format}</p>
-            <p><strong>Format:</strong> {job.original_format.upper()} → {job.target_format.upper()}</p>
-            <p><strong>Size:</strong> {job.file_size / 1024 / 1024:.1f} MB</p>
-        </div>
-        
-        <a href="/api/download/{job.id}" class="download-btn">📥 Download Your File</a>
-        
-        <p><small>⏰ This file will be automatically deleted after 24 hours</small></p>
-        
-        <div>
-            <a href="/" class="btn">🔄 Convert Another File</a>
-        </div>
-    </body>
-    </html>
-    """
-
-@app.route('/api/download/<job_id>')
-def api_download(job_id):
-    """Download file API"""
-    job = ConversionJob.query.get_or_404(job_id)
-    
-    if datetime.utcnow() > job.expires_at:
-        return jsonify({'error': 'File expired'}), 410
-    
-    if job.status != 'completed' or not job.converted_path:
-        return jsonify({'error': 'File not ready'}), 400
-    
-    if not os.path.exists(job.converted_path):
-        return jsonify({'error': 'File not found'}), 404
-    
-    original_name = job.original_filename.rsplit('.', 1)[0]
-    download_name = f"{original_name}.{job.target_format}"
-    
-    return send_file(job.converted_path, as_attachment=True, download_name=download_name)
-
+# ===== ADMIN ROUTES =====
 @app.route('/admin/login', methods=['GET', 'POST'])
 def admin_login():
-    """Admin login"""
     if request.method == 'POST':
         username = request.form.get('username')
         password = request.form.get('password')
         
-        if username == Config.ADMIN_USERNAME and password == Config.ADMIN_PASSWORD:
+        conn = sqlite3.connect('file_storage.db')
+        cursor = conn.cursor()
+        cursor.execute('SELECT value FROM settings WHERE key = ?', ('admin_username',))
+        db_username = cursor.fetchone()[0]
+        cursor.execute('SELECT value FROM settings WHERE key = ?', ('admin_password_hash',))
+        db_password_hash = cursor.fetchone()[0]
+        conn.close()
+        
+        if username == db_username and check_password_hash(db_password_hash, password):
             session['admin_logged_in'] = True
-            return redirect('/admin/dashboard')
+            session['admin_username'] = username
+            return redirect(url_for('admin_dashboard'))
         else:
-            flash('Invalid credentials')
+            return render_template('admin_login.html', error='Sai tên đăng nhập hoặc mật khẩu')
     
-    return """
-    <html>
-    <head><title>Admin Login</title></head>
-    <body style="font-family: Arial; max-width: 400px; margin: 100px auto; padding: 20px;">
-        <form method="POST" style="background: #f8f9fa; padding: 30px; border-radius: 10px;">
-            <h2>🔐 Admin Login</h2>
-            <div style="margin: 20px 0;">
-                <input type="text" name="username" placeholder="Username" required style="width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 5px;">
-            </div>
-            <div style="margin: 20px 0;">
-                <input type="password" name="password" placeholder="Password" required style="width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 5px;">
-            </div>
-            <button type="submit" style="width: 100%; background: #dc3545; color: white; padding: 10px; border: none; border-radius: 5px; cursor: pointer;">Login</button>
-            <p style="text-align: center; margin-top: 20px;"><a href="/">← Back to Converter</a></p>
-        </form>
-    </body>
-    </html>
-    """
-
-@app.route('/admin/dashboard')
-def admin_dashboard():
-    """Admin dashboard"""
-    if not session.get('admin_logged_in'):
-        return redirect('/admin/login')
-    
-    stats = {
-        'total_jobs': ConversionJob.query.count(),
-        'pending_jobs': ConversionJob.query.filter_by(status='pending').count(),
-        'processing_jobs': ConversionJob.query.filter_by(status='processing').count(),
-        'completed_jobs': ConversionJob.query.filter_by(status='completed').count(),
-        'failed_jobs': ConversionJob.query.filter_by(status='failed').count(),
-        'recent_jobs': ConversionJob.query.order_by(ConversionJob.created_at.desc()).limit(10).all()
-    }
-    
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Admin Dashboard - Video Converter</title>
-        <style>
-            body {{ font-family: Arial, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; }}
-            .header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }}
-            .stats-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin: 20px 0; }}
-            .stat-card {{ background: #f8f9fa; padding: 20px; border-radius: 10px; text-align: center; border-left: 4px solid #007bff; }}
-            .stat-value {{ font-size: 2em; font-weight: bold; color: #007bff; }}
-            .stat-label {{ color: #666; margin-top: 5px; }}
-            .jobs-table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
-            .jobs-table th, .jobs-table td {{ padding: 12px; border: 1px solid #ddd; text-align: left; }}
-            .jobs-table th {{ background: #f8f9fa; font-weight: bold; }}
-            .jobs-table tr:nth-child(even) {{ background: #f9f9f9; }}
-            .status {{ padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; }}
-            .status-pending {{ background: #fff3cd; color: #856404; }}
-            .status-processing {{ background: #cce5ff; color: #004085; }}
-            .status-completed {{ background: #d4edda; color: #155724; }}
-            .status-failed {{ background: #f8d7da; color: #721c24; }}
-            .btn {{ background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; text-decoration: none; display: inline-block; margin: 5px; }}
-            .btn-danger {{ background: #dc3545; }}
-            .btn-success {{ background: #28a745; }}
-            .progress-bar {{ width: 60px; height: 8px; background: #e9ecef; border-radius: 4px; overflow: hidden; }}
-            .progress-fill {{ height: 100%; background: #28a745; transition: width 0.3s ease; }}
-        </style>
-    </head>
-    <body>
-        <div class="header">
-            <h1>🎛️ Admin Dashboard</h1>
-            <div>
-                <a href="/" class="btn">🏠 Home</a>
-                <a href="/admin/logout" class="btn btn-danger">🚪 Logout</a>
-            </div>
-        </div>
-        
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-value">{stats['total_jobs']}</div>
-                <div class="stat-label">📊 Total Jobs</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value">{stats['pending_jobs']}</div>
-                <div class="stat-label">⏳ Pending</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value">{stats['processing_jobs']}</div>
-                <div class="stat-label">🔄 Processing</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value">{stats['completed_jobs']}</div>
-                <div class="stat-label">✅ Completed</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value">{stats['failed_jobs']}</div>
-                <div class="stat-label">❌ Failed</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value">{sum(job.file_size for job in ConversionJob.query.all()) / 1024 / 1024:.1f} MB</div>
-                <div class="stat-label">💾 Storage Used</div>
-            </div>
-        </div>
-        
-        <h2>📋 Recent Jobs</h2>
-        <table class="jobs-table">
-            <thead>
-                <tr>
-                    <th>Job ID</th>
-                    <th>Filename</th>
-                    <th>Format</th>
-                    <th>Status</th>
-                    <th>Progress</th>
-                    <th>Size</th>
-                    <th>Created</th>
-                    <th>Actions</th>
-                </tr>
-            </thead>
-            <tbody>
-                {generate_jobs_table_rows(stats['recent_jobs'])}
-            </tbody>
-        </table>
-        
-        <div style="text-align: center; margin: 30px 0;">
-            <button onclick="refreshDashboard()" class="btn">🔄 Refresh</button>
-            <button onclick="cleanupExpired()" class="btn btn-success">🗑️ Cleanup Expired</button>
-        </div>
-        
-        <div id="message" style="margin: 20px 0; padding: 10px; border-radius: 5px; display: none;"></div>
-        
-        <script>
-            function refreshDashboard() {{
-                location.reload();
-            }}
-            
-            function cleanupExpired() {{
-                if (confirm('Clean up all expired files?')) {{
-                    fetch('/admin/cleanup', {{method: 'POST'}})
-                        .then(response => response.json())
-                        .then(data => {{
-                            showMessage(data.message || 'Cleanup completed', 'success');
-                            setTimeout(refreshDashboard, 2000);
-                        }})
-                        .catch(error => {{
-                            showMessage('Cleanup failed: ' + error.message, 'error');
-                        }});
-                }}
-            }}
-            
-            function deleteJob(jobId) {{
-                if (confirm('Delete this job?')) {{
-                    fetch('/admin/delete/' + jobId, {{method: 'DELETE'}})
-                        .then(response => response.json())
-                        .then(data => {{
-                            showMessage('Job deleted successfully', 'success');
-                            setTimeout(refreshDashboard, 1000);
-                        }})
-                        .catch(error => {{
-                            showMessage('Delete failed: ' + error.message, 'error');
-                        }});
-                }}
-            }}
-            
-            function showMessage(text, type) {{
-                const messageDiv = document.getElementById('message');
-                messageDiv.textContent = text;
-                messageDiv.style.display = 'block';
-                messageDiv.style.background = type === 'success' ? '#d4edda' : '#f8d7da';
-                messageDiv.style.color = type === 'success' ? '#155724' : '#721c24';
-                messageDiv.style.border = '1px solid ' + (type === 'success' ? '#c3e6cb' : '#f5c6cb');
-            }}
-            
-            // Auto-refresh every 30 seconds
-            setInterval(refreshDashboard, 30000);
-        </script>
-    </body>
-    </html>
-    """
+    return render_template('admin_login.html')
 
 @app.route('/admin/logout')
 def admin_logout():
-    """Admin logout"""
     session.pop('admin_logged_in', None)
-    return redirect('/')
+    session.pop('admin_username', None)
+    return redirect(url_for('admin_login'))
 
-@app.route('/admin/cleanup', methods=['POST'])
-def admin_cleanup():
-    """Cleanup expired files"""
+@app.route('/admin')
+@admin_required
+def admin_dashboard():
+    return render_template('admin.html')
+
+# ===== ADMIN API ROUTES =====
+@app.route('/admin/api/stats')
+@admin_required
+def admin_stats():
     try:
-        if not session.get('admin_logged_in'):
-            return jsonify({'error': 'Unauthorized'}), 401
+        conn = sqlite3.connect('file_storage.db')
+        cursor = conn.cursor()
         
-        current_time = datetime.utcnow()
-        expired_jobs = ConversionJob.query.filter(ConversionJob.expires_at < current_time).all()
+        # Active visitors
+        cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=5)
+        cursor.execute('SELECT COUNT(*) FROM visitors WHERE is_active = 1 AND last_activity > ?', (cutoff_time,))
+        active_visitors = cursor.fetchone()[0]
         
-        deleted_count = 0
-        for job in expired_jobs:
-            try:
-                # Delete files
-                if job.original_path and os.path.exists(job.original_path):
-                    os.remove(job.original_path)
-                if job.converted_path and os.path.exists(job.converted_path):
-                    os.remove(job.converted_path)
-                
-                # Delete database record
-                db.session.delete(job)
-                deleted_count += 1
-            except Exception as e:
-                print(f"Error deleting job {job.id}: {e}")
+        # Total files
+        cursor.execute('SELECT COUNT(*) FROM files WHERE expires_at > ?', (datetime.now(timezone.utc),))
+        total_files = cursor.fetchone()[0]
         
-        db.session.commit()
+        # Total downloads
+        cursor.execute('SELECT SUM(download_count) FROM files')
+        total_downloads = cursor.fetchone()[0] or 0
+        
+        # Active banners
+        cursor.execute('SELECT COUNT(*) FROM banners WHERE status = 1')
+        active_banners = cursor.fetchone()[0]
+        
+        conn.close()
         
         return jsonify({
             'success': True,
-            'message': f'Cleaned up {deleted_count} expired files'
+            'stats': {
+                'visitors': {'active_now': active_visitors},
+                'files': {'total_files': total_files, 'total_downloads': total_downloads},
+                'banners': {'active_banners': active_banners}
+            }
         })
         
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Stats API error: {e}")
+        return jsonify({'success': False, 'error': str(e)})
 
-@app.route('/admin/delete/<job_id>', methods=['DELETE'])
-def admin_delete_job(job_id):
-    """Delete specific job"""
-    try:
-        if not session.get('admin_logged_in'):
-            return jsonify({'error': 'Unauthorized'}), 401
-        
-        job = ConversionJob.query.get_or_404(job_id)
-        
-        # Delete files
-        if job.original_path and os.path.exists(job.original_path):
-            os.remove(job.original_path)
-        if job.converted_path and os.path.exists(job.converted_path):
-            os.remove(job.converted_path)
-        
-        # Delete database record
-        db.session.delete(job)
-        db.session.commit()
-        
-        return jsonify({'success': True, 'message': 'Job deleted successfully'})
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+# Continue with the rest of the admin API routes...
+# (Banner management, cache management, settings, etc.)
+# [Previous admin routes remain the same]
 
-def generate_jobs_table_rows(jobs):
-    """Generate HTML table rows for jobs"""
-    if not jobs:
-        return "<tr><td colspan='8' style='text-align: center; color: #666;'>No jobs found</td></tr>"
-    
-    rows = ""
-    for job in jobs:
-        status_class = f"status-{job.status}"
-        progress_width = f"{job.progress}%"
-        
-        rows += f"""
-        <tr>
-            <td style="font-family: monospace; font-size: 12px;">{job.id[:8]}...</td>
-            <td>{job.original_filename}</td>
-            <td>{job.original_format.upper()} → {job.target_format.upper()}</td>
-            <td><span class="status {status_class}">{job.status.upper()}</span></td>
-            <td>
-                <div class="progress-bar">
-                    <div class="progress-fill" style="width: {progress_width}"></div>
-                </div>
-                <small>{job.progress}%</small>
-            </td>
-            <td>{job.file_size / 1024 / 1024:.1f} MB</td>
-            <td>{job.created_at.strftime('%m/%d %H:%M')}</td>
-            <td>
-                {"<a href='/download/" + job.id + "' class='btn' style='font-size: 12px; padding: 4px 8px;'>📥</a>" if job.status == 'completed' else ""}
-                <button onclick="deleteJob('{job.id}')" class="btn btn-danger" style="font-size: 12px; padding: 4px 8px;">🗑️</button>
-            </td>
-        </tr>
-        """
-    
-    return rows
+# ===== ERROR HANDLERS =====
+@app.errorhandler(413)
+def file_too_large(error):
+    return jsonify({'success': False, 'error': f'File quá lớn. Tối đa 15GB'}), 413
 
-# =============================================================================
-# ERROR HANDLERS
-# =============================================================================
 @app.errorhandler(404)
 def not_found(error):
-    return """
-    <h1>❌ Page Not Found</h1>
-    <p>The page you're looking for doesn't exist.</p>
-    <a href="/">🏠 Go Home</a>
-    """, 404
+    return render_template('index.html', error='Trang không tồn tại'), 404
 
 @app.errorhandler(500)
 def internal_error(error):
-    return """
-    <h1>💥 Server Error</h1>
-    <p>Something went wrong on our end.</p>
-    <a href="/">🏠 Go Home</a>
-    """, 500
+    return render_template('index.html', error='Lỗi server'), 500
 
-# =============================================================================
-# INITIALIZE AND RUN
-# =============================================================================
+# ===== ADMIN API ROUTES (Tiếp theo) =====
+@app.route('/admin/api/cache', methods=['GET', 'POST'])
+@admin_required
+def admin_cache():
+    try:
+        if request.method == 'GET':
+            # Get cache info
+            total_files = 0
+            total_size = 0
+            
+            for filename in os.listdir(STORAGE_FOLDER):
+                file_path = os.path.join(STORAGE_FOLDER, filename)
+                if os.path.isfile(file_path):
+                    total_files += 1
+                    total_size += os.path.getsize(file_path)
+            
+            cache_info = {
+                'total_files': total_files,
+                'total_size_mb': round(total_size / (1024 * 1024), 2)
+            }
+            
+            return jsonify({'success': True, 'cache_info': cache_info})
+            
+        elif request.method == 'POST':
+            data = request.get_json()
+            action = data.get('action')
+            
+            if action == 'cleanup_old':
+                deleted_count = cache_scheduler.cleanup_expired_files()
+                message = f'Đã xóa {deleted_count} file hết hạn'
+                
+            elif action == 'clear_all':
+                # Clear all files (dangerous!)
+                deleted_count = 0
+                try:
+                    conn = sqlite3.connect('file_storage.db')
+                    cursor = conn.cursor()
+                    
+                    cursor.execute('SELECT stored_name FROM files')
+                    all_files = cursor.fetchall()
+                    
+                    for (stored_name,) in all_files:
+                        file_path = os.path.join(STORAGE_FOLDER, stored_name)
+                        if os.path.exists(file_path):
+                            os.remove(file_path)
+                            deleted_count += 1
+                    
+                    cursor.execute('DELETE FROM files')
+                    cursor.execute('DELETE FROM download_stats')
+                    
+                    conn.commit()
+                    conn.close()
+                    
+                    message = f'Đã xóa tất cả {deleted_count} file'
+                    
+                except Exception as e:
+                    logger.error(f"Clear all cache error: {e}")
+                    return jsonify({'success': False, 'error': str(e)})
+                
+            else:
+                return jsonify({'success': False, 'error': 'Invalid action'})
+            
+            return jsonify({
+                'success': True,
+                'message': message,
+                'deleted_count': deleted_count
+            })
+            
+    except Exception as e:
+        logger.error(f"Cache API error: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/admin/api/banners', methods=['GET', 'POST', 'PUT', 'DELETE'])
+@admin_required
+def admin_banners():
+    try:
+        conn = sqlite3.connect('file_storage.db')
+        cursor = conn.cursor()
+        
+        if request.method == 'GET':
+            cursor.execute('SELECT * FROM banners ORDER BY id DESC')
+            
+            banners = []
+            for row in cursor.fetchall():
+                banners.append({
+                    'id': row[0],
+                    'title': row[1],
+                    'description': row[2],
+                    'image_path': row[3],
+                    'link_url': row[4],
+                    'position': row[5],
+                    'clicks': row[6],
+                    'status': bool(row[7]),
+                    'created_at': row[8]
+                })
+            
+            conn.close()
+            return jsonify({'success': True, 'banners': banners})
+            
+        elif request.method == 'POST':
+            data = request.get_json()
+            if not data:
+                return jsonify({'success': False, 'error': 'No data received'})
+            
+            cursor.execute('''
+                INSERT INTO banners (title, description, image_path, link_url, position, status)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                data.get('title', ''),
+                data.get('description', ''),
+                data.get('image_path', ''),
+                data.get('link_url', ''),
+                data.get('position', 'left'),
+                1 if data.get('status', True) else 0
+            ))
+            
+            banner_id = cursor.lastrowid
+            conn.commit()
+            conn.close()
+            
+            return jsonify({
+                'success': True, 
+                'banner_id': banner_id, 
+                'message': 'Banner đã được tạo thành công'
+            })
+            
+        elif request.method == 'PUT':
+            data = request.get_json()
+            if not data or not data.get('id'):
+                return jsonify({'success': False, 'error': 'Missing banner ID'})
+            
+            banner_id = data.get('id')
+            
+            cursor.execute('''
+                UPDATE banners 
+                SET title = ?, description = ?, image_path = ?, link_url = ?, 
+                    position = ?, status = ?
+                WHERE id = ?
+            ''', (
+                data.get('title', ''),
+                data.get('description', ''),
+                data.get('image_path', ''),
+                data.get('link_url', ''),
+                data.get('position', 'left'),
+                1 if data.get('status', True) else 0,
+                banner_id
+            ))
+            
+            conn.commit()
+            conn.close()
+            
+            return jsonify({
+                'success': True, 
+                'message': 'Banner đã được cập nhật thành công'
+            })
+            
+        elif request.method == 'DELETE':
+            data = request.get_json()
+            if not data or not data.get('id'):
+                return jsonify({'success': False, 'error': 'Missing banner ID'})
+            
+            banner_id = data.get('id')
+            
+            # Get image path to delete file
+            cursor.execute('SELECT image_path FROM banners WHERE id = ?', (banner_id,))
+            result = cursor.fetchone()
+            
+            if result and result[0]:
+                image_path = result[0]
+                full_path = os.path.join(app.root_path, image_path.lstrip('/'))
+                if os.path.exists(full_path):
+                    try:
+                        os.remove(full_path)
+                    except:
+                        pass
+            
+            cursor.execute('DELETE FROM banners WHERE id = ?', (banner_id,))
+            conn.commit()
+            conn.close()
+            
+            return jsonify({
+                'success': True, 
+                'message': 'Banner đã được xóa thành công'
+            })
+            
+    except Exception as e:
+        logger.error(f"Banner API error: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/admin/upload', methods=['POST'])
+@admin_required  
+def admin_upload():
+    try:
+        if 'image' not in request.files:
+            return jsonify({'success': False, 'error': 'Không có file hình ảnh'})
+        
+        file = request.files['image']
+        if file.filename == '':
+            return jsonify({'success': False, 'error': 'Chưa chọn file'})
+        
+        # Validate file extension
+        file_extension = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else ''
+        
+        if file_extension not in ALLOWED_BANNER_EXTENSIONS:
+            return jsonify({'success': False, 'error': 'Định dạng file không được hỗ trợ'})
+        
+        # Generate unique filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{timestamp}_{secure_filename(file.filename)}"
+        file_path = os.path.join(UPLOAD_FOLDER, filename)
+        
+        # Save file
+        file.save(file_path)
+        
+        # Return relative path for web use
+        web_path = f"/static/uploads/banners/{filename}"
+        
+        return jsonify({
+            'success': True,
+            'image_path': web_path,
+            'message': 'Hình ảnh đã được upload thành công'
+        })
+        
+    except Exception as e:
+        logger.error(f"Upload error: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/admin/api/visitors')
+@admin_required
+def admin_visitors():
+    try:
+        conn = sqlite3.connect('file_storage.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT session_id, ip_address, user_agent, first_visit, last_activity, 
+                   page_views, is_active
+            FROM visitors 
+            ORDER BY last_activity DESC 
+            LIMIT 50
+        ''')
+        
+        visitors = []
+        for row in cursor.fetchall():
+            visitors.append({
+                'session_id': row[0][:8] + '...',
+                'ip_address': row[1],
+                'user_agent': row[2][:50] + '...' if len(row[2]) > 50 else row[2],
+                'first_visit': row[3],
+                'last_activity': row[4],
+                'page_views': row[5],
+                'is_active': bool(row[6])
+            })
+        
+        conn.close()
+        
+        return jsonify({
+            'success': True,
+            'visitors': visitors,
+            'active_count': visitor_tracker.get_active_count()
+        })
+        
+    except Exception as e:
+        logger.error(f"Visitors API error: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/admin/api/files')
+@admin_required
+def admin_files():
+    try:
+        conn = sqlite3.connect('file_storage.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT id, original_name, file_type, file_size, 
+                   download_count, uploaded_at, expires_at, uploader_ip
+            FROM files 
+            ORDER BY uploaded_at DESC 
+            LIMIT 50
+        ''')
+        
+        files = []
+        for row in cursor.fetchall():
+            files.append({
+                'id': row[0][:8] + '...',
+                'name': row[1],
+                'type': row[2],
+                'size': format_file_size(row[3]),
+                'downloads': row[4],
+                'uploaded_at': row[5],
+                'expires_at': row[6],
+                'uploader_ip': row[7]
+            })
+        
+        conn.close()
+        
+        return jsonify({'success': True, 'files': files})
+        
+    except Exception as e:
+        logger.error(f"Files API error: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/admin/api/settings', methods=['GET', 'POST'])
+@admin_required
+def admin_settings():
+    try:
+        conn = sqlite3.connect('file_storage.db')
+        cursor = conn.cursor()
+        
+        if request.method == 'GET':
+            cursor.execute('SELECT key, value, description FROM settings')
+            settings = []
+            for row in cursor.fetchall():
+                # Don't expose password hash
+                if row[0] == 'admin_password_hash':
+                    continue
+                settings.append({
+                    'key': row[0],
+                    'value': row[1],
+                    'description': row[2]
+                })
+            
+            conn.close()
+            return jsonify({'success': True, 'settings': settings})
+            
+        elif request.method == 'POST':
+            data = request.get_json()
+            settings_to_update = data.get('settings', {})
+            
+            for key, value in settings_to_update.items():
+                if key == 'admin_password':
+                    if len(value) < 6:
+                        conn.close()
+                        return jsonify({'success': False, 'error': 'Mật khẩu phải có ít nhất 6 ký tự'})
+                    
+                    password_hash = generate_password_hash(value)
+                    cursor.execute('UPDATE settings SET value = ? WHERE key = ?', 
+                                 (password_hash, 'admin_password_hash'))
+                else:
+                    cursor.execute('UPDATE settings SET value = ? WHERE key = ?', (value, key))
+            
+            conn.commit()
+            conn.close()
+            
+            return jsonify({'success': True, 'message': 'Cài đặt đã được cập nhật'})
+            
+    except Exception as e:
+        logger.error(f"Settings API error: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
+# ===== RUN SERVER =====
 if __name__ == '__main__':
-    with app.app_context():
-        db.create_all()
-    
-    print("=" * 60)
-    print("🎬 VIDEO CONVERTER SERVER STARTING")
-    print("=" * 60)
-    print(f"📍 Server running at: http://localhost:5000")
-    print(f"🌐 External access: http://192.168.88.254:5000") 
-    print(f"👤 Admin login: http://localhost:5000/admin/login")
-    print(f"🔑 Username: {Config.ADMIN_USERNAME}")
-    print(f"🔐 Password: {Config.ADMIN_PASSWORD}")
-    print(f"🧪 Test page: http://localhost:5000/test")
-    print("=" * 60)
-    print("📁 Upload folder:", Config.UPLOAD_FOLDER)
-    print("📂 Original folder:", Config.ORIGINAL_FOLDER) 
-    print("📂 Converted folder:", Config.CONVERTED_FOLDER)
-    print("📦 Supported formats:", ', '.join(Config.ALLOWED_EXTENSIONS))
-    print("=" * 60)
+    print("=" * 70)
+    print("🗂️  FILE STORAGE & SHARING SERVICE")
+    print("=" * 70)
+    print(f"🌐 URL: http://localhost:5000")
+    print(f"👤 Admin: http://localhost:5000/admin")
+    print(f"🔑 Login: admin / admin123")
+    print(f"📁 Storage: {STORAGE_FOLDER}")
+    print(f"📊 Max size: 15GB (Admin controlled)")
+    print(f"⏰ Expiration: Admin controlled (default 30 days)")
+    print("=" * 70)
+    print("📢 Features:")
+    print("  - File upload & sharing with links")
+    print("  - Banner management system")
+    print("  - Auto cache cleanup scheduler")
+    print("  - Visitor tracking & analytics")
+    print("  - QR code generation")
+    print("  - Password protection")
+    print("  - Admin-controlled settings")
+    print("=" * 70)
+    print("⚠️  ADMIN CONTROLS:")
+    print("  - File expiration time")
+    print("  - Maximum file size (15GB)")
+    print("  - Download limits per file")
+    print("  - Auto cleanup schedule")
+    print("=" * 70)
     
     app.run(host='0.0.0.0', port=5000, debug=True)

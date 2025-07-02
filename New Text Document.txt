@@ -1,0 +1,16 @@
+converter/
+├── 📄 app.py                    # Tất cả logic trong 1 file
+├── 📄 config.py                 # Cấu hình đơn giản
+├── 📁 templates/                # Chỉ 3 file HTML
+│   ├── index.html              # Homepage + upload
+│   ├── progress.html           # Progress + download
+│   └── admin.html              # Admin panel
+├── 📁 static/                   # 1 file CSS + 1 file JS
+│   ├── style.css               # Tất cả CSS
+│   └── script.js               # Tất cả JavaScript
+├── 📁 uploads/                  # File storage
+│   ├── original/
+│   └── converted/
+├── 📄 cleanup.py                # Background cleanup
+├── 📄 requirements.txt          # Dependencies
+└── 📄 .gitignore               # Git ignore
